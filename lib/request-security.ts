@@ -1,4 +1,7 @@
 import { isIP } from "node:net";
+import { readFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
 
 function normalizeHostname(value: string): string {
   const unbracketed = value.startsWith("[") && value.endsWith("]")
@@ -44,10 +47,56 @@ function isLoopbackHostname(hostname: string): boolean {
   return hostname === "localhost" || hostname.endsWith(".localhost");
 }
 
+/**
+ * Runtime-updatable allowed hosts.
+ *
+ * `PI_WEB_ALLOWED_HOSTS` is read once at process start, so changing it required
+ * a full restart. Operators (and the agent running *inside* this server) can
+ * instead append hosts to a plain-text file to take effect within seconds,
+ * without restarting the process they are talking through.
+ */
+function agentDir(): string {
+  const envDir = process.env.PI_CODING_AGENT_DIR?.trim();
+  if (envDir) {
+    return envDir.startsWith("~") ? join(homedir(), envDir.slice(1)) : envDir;
+  }
+  return join(homedir(), ".pi", "agent");
+}
+
+function allowedHostsFilePath(): string {
+  return process.env.PI_WEB_ALLOWED_HOSTS_FILE?.trim() || join(agentDir(), "pi-web-allowed-hosts");
+}
+
+declare global {
+  var __piWebAllowedHostsFileCache: { hosts: string[]; expiresAt: number } | undefined;
+}
+
+const ALLOWED_HOSTS_FILE_TTL_MS = 5_000;
+
+/** One hostname per line; `#` starts a comment. Absent file = no extra hosts. */
+function allowedHostsFromFile(): string[] {
+  const now = Date.now();
+  const cached = globalThis.__piWebAllowedHostsFileCache;
+  if (cached && cached.expiresAt > now) return cached.hosts;
+  let hosts: string[] = [];
+  try {
+    const content = readFileSync(allowedHostsFilePath(), "utf8");
+    hosts = content
+      .split(/\r?\n/)
+      .map((line) => line.split("#", 1)[0]?.trim() ?? "")
+      .filter((line) => line.length > 0);
+  } catch {
+    // No runtime hosts file yet — ignore.
+  }
+  globalThis.__piWebAllowedHostsFileCache = { hosts, expiresAt: now + ALLOWED_HOSTS_FILE_TTL_MS };
+  return hosts;
+}
+
 function configuredHostnamesFromEnvironment(): string[] {
   return [
     process.env.PI_WEB_HOSTNAME,
     ...(process.env.PI_WEB_ALLOWED_HOSTS?.split(",") ?? []),
+    ...allowedHostsFromFile(),
   ].filter((value): value is string => Boolean(value?.trim()));
 }
 

@@ -148,7 +148,7 @@ function GeneralSettings({ sessionId, onSessionReloaded, quoteSelectionEnabled, 
         : Notification.permission;
       if (permission !== "granted") throw new Error("unsupported or not permitted");
       const ok = await setupPushSubscription(locale);
-      if (!ok) throw new Error("unsupported or not permitted");
+      if (!ok) throw new Error("浏览器不支持 Web Push 或通知权限未授予");
       setPushStatus({ kind: "ok", message: t("settings.pushRegistered") });
     } catch (cause) {
       setPushStatus({ kind: "error", message: `${t("settings.pushRegisterFailed")} ${cause instanceof Error ? cause.message : String(cause)}` });

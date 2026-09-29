@@ -14,8 +14,10 @@ import {
 } from "./project-command-env";
 import { cacheSessionPath, getLatestModelChange, invalidateSessionListCache, readLatestSessionEntryId, resolveSessionPath } from "./session-reader";
 import { getProjectTrustStatus, projectTrustReloadOptions } from "./project-trust";
+import { createRemoteBashOperations, parseRemoteWorkspaceData, parseSshCommand, remoteWorkspaceSessionSeeds, REMOTE_SESSION_STATE_ENTRY_TYPE, REMOTE_WORKSPACE_ENTRY_TYPE, type RemoteWorkspace } from "./remote-workspace";
 import { persistExplicitStartupPreferences } from "./startup-preferences";
 import { notifySessionComplete } from "./web-push";
+import { sendFeishuCompletionNotification } from "./feishu-outbound";
 import { hasActiveSessionLivenessProvider } from "./session-liveness";
 import type { SlashCommandInfo } from "@earendil-works/pi-coding-agent";
 import type { AgentSessionLike, ExtensionUiContextLike, ToolInfo } from "./pi-types";
@@ -165,6 +167,8 @@ export interface RpcSessionStartOptions {
   initialModel?: { provider: string; modelId: string };
   allowInitialModelFallback?: boolean;
   thinkingLevel?: ThinkingLevel;
+  /** Present when this new session is a remote (SSH) workspace. */
+  remote?: RemoteWorkspace;
 }
 
 const CODING_TOOL_NAMES = ["read", "bash", "powershell", "edit", "write", "grep", "find", "ls"];
@@ -495,6 +499,17 @@ export class AgentSessionWrapper {
     // manager as flushed after writing its own generated entries.
     (manager as unknown as { flushed: boolean }).flushed = true;
     cacheSessionPath(this.inner.sessionId, sessionFile);
+  }
+
+  /** Resolves the remote ssh target + current remote cwd when this session is a remote workspace. */
+  private remoteBashTarget(): { target: NonNullable<ReturnType<typeof parseSshCommand>>; cwd: string } | null {
+    const entries = this.inner.sessionManager.getEntries() as unknown as SessionEntry[];
+    const remote = readRemoteWorkspace(entries);
+    if (!remote) return null;
+    const target = parseSshCommand(remote.command);
+    if (!target) return null;
+    const cwd = readRemoteSessionCwd(entries) ?? remote.cwd;
+    return { target, cwd };
   }
 
   onEvent(listener: EventListener): () => void {
@@ -975,14 +990,20 @@ export class AgentSessionWrapper {
         if (this.pendingPromptCount > 0 || this.inner.isStreaming || this.inner.isCompacting || this.inner.isBashRunning) {
           throw new Error("Cannot run a shell command while the session is busy");
         }
+        // Remote workspaces route the user's `!command` shell commands over SSH
+        // too, so `!ls -la` shows the remote cwd instead of the empty anchor dir.
+        const remoteTarget = this.remoteBashTarget();
+        const operations = remoteTarget
+          ? createRemoteBashOperations(remoteTarget.target, remoteTarget.cwd)
+          : createProjectCommandBashOperations({
+              shellPath: this.inner.settingsManager.getShellPath(),
+            });
         const execution = this.inner.executeBash(
           command.command as string,
           undefined,
           {
             excludeFromContext: command.excludeFromContext as boolean | undefined,
-            operations: createProjectCommandBashOperations({
-              shellPath: this.inner.settingsManager.getShellPath(),
-            }),
+            operations,
           },
         );
         try {
@@ -1849,6 +1870,26 @@ function runtimeMessageActivityMs(entry: SessionMessageEntry): number | undefine
  * the first JSONL flush until an assistant message exists, so an accepted new
  * prompt must temporarily be described from its in-memory SessionManager.
  */
+function readRemoteWorkspace(entries: SessionEntry[]): RemoteWorkspace | undefined {
+  for (let index = entries.length - 1; index >= 0; index -= 1) {
+    const entry = entries[index];
+    if (!entry || entry.type !== "custom" || entry.customType !== REMOTE_WORKSPACE_ENTRY_TYPE) continue;
+    return parseRemoteWorkspaceData(entry.data) ?? undefined;
+  }
+  return undefined;
+}
+
+function readRemoteSessionCwd(entries: SessionEntry[]): string | undefined {
+  for (let index = entries.length - 1; index >= 0; index -= 1) {
+    const entry = entries[index];
+    if (!entry || entry.type !== "custom" || entry.customType !== REMOTE_SESSION_STATE_ENTRY_TYPE) continue;
+    const data = entry.data as { cwd?: unknown; connected?: unknown } | undefined;
+    if (data && typeof data.cwd === "string" && data.cwd.trim()) return data.cwd;
+    return undefined;
+  }
+  return undefined;
+}
+
 export function getRpcSessionInfos(options: { includeTransient?: boolean } = {}): SessionInfo[] {
   const sessions: SessionInfo[] = [];
   for (const session of getRegistry().values()) {
@@ -1865,6 +1906,7 @@ export function getRpcSessionInfos(options: { includeTransient?: boolean } = {})
     const sessionFile = manager.getSessionFile() ?? session.sessionFile;
     const persisted = Boolean(sessionFile && existsSync(sessionFile));
     const subagent = readSubagentRun(entries as unknown as SessionEntry[], header?.id ?? session.sessionId, sessionFile ?? "");
+    const remoteWorkspace = readRemoteWorkspace(entries as unknown as SessionEntry[]);
 
     // An ensure_session call creates an idle, empty runtime while the composer
     // loads commands. Do not leak it into history before a prompt is accepted.
@@ -1900,6 +1942,7 @@ export function getRpcSessionInfos(options: { includeTransient?: boolean } = {})
         },
       } : {}),
       transient: !persisted,
+      ...(remoteWorkspace ? { remoteWorkspace } : {}),
     });
   }
   return sessions;
@@ -1972,6 +2015,13 @@ export async function startRpcSession(
   } else {
     if (!cwd) throw new Error("cwd is required for a new session");
     sessionManager = SessionManager.create(cwd, undefined);
+    if (options.remote) {
+      // Seed the session so the pi-ssh-remote extension auto-connects on
+      // session_start, and pi-web can label/gate the workspace as remote.
+      for (const seed of remoteWorkspaceSessionSeeds(options.remote)) {
+        sessionManager.appendCustomEntry(seed.customType, seed.data);
+      }
+    }
   }
   const sessionCwd = sessionManager.getCwd();
   const subagentResources = sessionFile
@@ -2145,6 +2195,9 @@ export async function startRpcSession(
       onAgentRunComplete: (completedSessionId) => {
         void notifySessionComplete(completedSessionId).catch((error) => {
           console.error("[pi-web] failed to send completion push:", error instanceof Error ? error.message : error);
+        });
+        void sendFeishuCompletionNotification(completedSessionId).catch((error) => {
+          console.error("[pi-web] 飞书完成通知发送失败:", error instanceof Error ? error.message : error);
         });
       },
       suppressCompletionNotifications: Boolean(subagentResources),

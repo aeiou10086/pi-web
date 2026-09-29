@@ -1,8 +1,10 @@
 import { configureHttpDispatcher } from "@/lib/http-dispatcher";
 import { closeAllAgentEventStreams } from "@/lib/agent-event-stream";
+import { startFeishuInbound } from "@/lib/feishu-inbound";
 
 export function registerNodeInstrumentation(): void {
   configureHttpDispatcher();
+  startFeishuInbound();
 
   // In production Next 16 answers SIGINT/SIGTERM with server.close() and waits
   // for every connection to end, without a timeout. SSE streams only end when

@@ -31,38 +31,43 @@ export async function setupPushSubscription(locale: string): Promise<boolean> {
   if (activeSubscriptionPromise) return activeSubscriptionPromise;
 
   const attempt = (async () => {
-    try {
-      const configResponse = await fetch("/api/push/config");
-      if (!configResponse.ok) return false;
-      const { publicKey } = await configResponse.json() as { publicKey?: string };
-      if (!publicKey) return false;
+    const configResponse = await fetch("/api/push/config");
+    if (!configResponse.ok) throw new Error(`push/config HTTP ${configResponse.status}`);
+    const { publicKey } = await configResponse.json() as { publicKey?: string };
+    if (!publicKey) throw new Error("push/config 未返回 publicKey");
 
-      const registration = await navigator.serviceWorker.ready;
-      let subscription = await registration.pushManager.getSubscription();
-      if (!subscription) {
+    let registration: ServiceWorkerRegistration;
+    try {
+      registration = await navigator.serviceWorker.ready;
+    } catch (error) {
+      throw new Error(`Service Worker 未就绪: ${error instanceof Error ? error.message : String(error)}`);
+    }
+
+    let subscription = await registration.pushManager.getSubscription();
+    if (!subscription) {
+      try {
         subscription = await registration.pushManager.subscribe({
           userVisibleOnly: true,
           applicationServerKey: urlBase64ToUint8Array(publicKey),
         });
+      } catch (error) {
+        throw new Error(`pushManager.subscribe 失败: ${error instanceof Error ? error.message : String(error)}`);
       }
-
-      const response = await fetch("/api/push/subscribe", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ subscription: subscription.toJSON(), locale }),
-      });
-      return response.ok;
-    } catch {
-      // Retry on the next trigger (e.g. the next permission grant) rather
-      // than caching a transient failure forever.
-      activeSubscriptionPromise = null;
-      return false;
     }
+
+    const response = await fetch("/api/push/subscribe", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ subscription: subscription.toJSON(), locale }),
+    });
+    if (!response.ok) throw new Error(`push/subscribe HTTP ${response.status}`);
+    return true;
   })();
 
   activeSubscriptionPromise = attempt;
-  void attempt.then((ok) => {
-    if (!ok && activeSubscriptionPromise === attempt) activeSubscriptionPromise = null;
-  });
+  void attempt.then(
+    () => {},
+    () => { if (activeSubscriptionPromise === attempt) activeSubscriptionPromise = null; },
+  );
   return attempt;
 }

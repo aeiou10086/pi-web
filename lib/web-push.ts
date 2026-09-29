@@ -1,11 +1,10 @@
-import { SessionManager } from "@earendil-works/pi-coding-agent";
 import { existsSync, mkdirSync, readFileSync } from "fs";
 import { dirname, join } from "path";
 import webpush from "web-push";
 import { writePrivateFileAtomicSync } from "./atomic-file";
 import { enLocale } from "./i18n/messages/en";
 import { zhCNLocale } from "./i18n/messages/zh-CN";
-import { getAgentDir } from "./session-reader";
+import { getAgentDir, listSessionSummaries } from "./session-reader";
 
 export interface PushSubscriptionRecord {
   endpoint: string;
@@ -18,6 +17,12 @@ interface PushStateFile {
   subscriptions: PushSubscriptionRecord[];
 }
 
+interface SessionSummary {
+  name?: string;
+  cwd: string;
+  firstMessage: string;
+}
+
 interface WebPushEnvironment {
   send: (
     subscription: PushSubscriptionRecord,
@@ -27,7 +32,7 @@ interface WebPushEnvironment {
   loadState: () => PushStateFile | null;
   saveState: (state: PushStateFile) => void;
   generateVapidKeys: () => PushStateFile["vapidKeys"];
-  listSessionNames: () => Promise<Map<string, string>>;
+  listSessionSummaries: () => Promise<Map<string, SessionSummary>>;
 }
 
 export interface WebPushNotifier {
@@ -89,16 +94,20 @@ function getDefaultEnvironment(): WebPushEnvironment {
       writePrivateFileAtomicSync(path, JSON.stringify(state));
     },
     generateVapidKeys: () => webpush.generateVAPIDKeys(),
-    async listSessionNames() {
-      const names = new Map<string, string>();
+    async listSessionSummaries() {
+      const summaries = new Map<string, SessionSummary>();
       try {
-        for (const session of await SessionManager.listAll()) {
-          if (session.name) names.set(session.id, session.name);
+        for (const session of await listSessionSummaries()) {
+          summaries.set(session.id, {
+            ...(session.name ? { name: session.name } : {}),
+            cwd: session.cwd,
+            firstMessage: session.firstMessage,
+          });
         }
       } catch {
         // Session list is best-effort; fall back to the generic title.
       }
-      return names;
+      return summaries;
     },
   };
 }
@@ -145,32 +154,36 @@ export function createWebPushNotifier(environment: WebPushEnvironment): WebPushN
       saveState();
     },
     async notifySessionComplete(sessionId) {
-      if (state.subscriptions.length === 0) return;
-      const sessionName = (await environment.listSessionNames()).get(sessionId);
-      const payloadFor = (locale: string) => ({
-        title: sessionName ?? localeText(locale, "sessionComplete"),
-        body: localeText(locale, "taskFinished"),
-        url: `/?session=${encodeURIComponent(sessionId)}`,
-        tag: `pi-session-complete:${sessionId}`,
-      });
+      const summary = (await environment.listSessionSummaries()).get(sessionId);
+      const sessionName = summary?.name;
 
-      let pruned = false;
-      for (const subscription of [...state.subscriptions]) {
-        try {
-          await environment.send(
-            subscription,
-            JSON.stringify(payloadFor(subscription.locale)),
-            state.vapidKeys,
-          );
-        } catch (error) {
-          const statusCode = pushStatusCode(error);
-          if (statusCode === 404 || statusCode === 410) {
-            state.subscriptions = state.subscriptions.filter((s) => s.endpoint !== subscription.endpoint);
-            pruned = true;
+      // Web Push (browsers whose push service is reachable, e.g. desktop Chrome).
+      if (state.subscriptions.length > 0) {
+        const payloadFor = (locale: string) => ({
+          title: sessionName ?? localeText(locale, "sessionComplete"),
+          body: localeText(locale, "taskFinished"),
+          url: `/?session=${encodeURIComponent(sessionId)}`,
+          tag: `pi-session-complete:${sessionId}`,
+        });
+
+        let pruned = false;
+        for (const subscription of [...state.subscriptions]) {
+          try {
+            await environment.send(
+              subscription,
+              JSON.stringify(payloadFor(subscription.locale)),
+              state.vapidKeys,
+            );
+          } catch (error) {
+            const statusCode = pushStatusCode(error);
+            if (statusCode === 404 || statusCode === 410) {
+              state.subscriptions = state.subscriptions.filter((s) => s.endpoint !== subscription.endpoint);
+              pruned = true;
+            }
           }
         }
+        if (pruned) saveState();
       }
-      if (pruned) saveState();
     },
   };
 }

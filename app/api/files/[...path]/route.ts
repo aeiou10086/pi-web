@@ -9,6 +9,7 @@ import {
 import {
   DOCX_PREVIEW_MAX_BYTES,
   IMAGE_PREVIEW_MAX_BYTES,
+  TEXT_PREVIEW_MAX_BYTES,
   documentPreviewKind,
   getAudioMime,
   getDocumentMime,
@@ -27,6 +28,7 @@ import {
 import { parseFormDataWithinLimit, RequestBodyTooLargeError } from "@/lib/bounded-form-data";
 import { filePathFromApiSegments, samePath } from "@/lib/paths";
 import { readTextPreviewChunk } from "@/lib/text-preview";
+import { remoteListDir, remoteReadBounded, remoteStat, resolveRemoteFile } from "@/lib/remote-fs";
 
 const IGNORED_NAMES = new Set([
   "node_modules", ".git", ".next", "dist", "build", "__pycache__",
@@ -71,6 +73,93 @@ function getLanguage(filePath: string): string {
 
 function parseFileRequestType(value: string): FileRequestType | null {
   return FILE_REQUEST_TYPE_SET.has(value) ? (value as FileRequestType) : null;
+}
+
+function textChunkFromBuffer(buffer: Buffer, fileSize: number, offset: number): { content: string; nextOffset: number; truncated: boolean } {
+  let end = Math.min(buffer.length, TEXT_PREVIEW_MAX_BYTES);
+  if (offset + end < fileSize && end > 0) {
+    let sequenceStart = end;
+    while (sequenceStart > end - 3 && sequenceStart > 0 && (buffer[sequenceStart] & 0xc0) === 0x80) {
+      sequenceStart -= 1;
+    }
+    const byte = buffer[sequenceStart] ?? 0;
+    let length = 1;
+    if ((byte & 0xe0) === 0xc0) length = 2;
+    else if ((byte & 0xf0) === 0xe0) length = 3;
+    else if ((byte & 0xf8) === 0xf0) length = 4;
+    if (length > end - sequenceStart) end = sequenceStart;
+  }
+  const nextOffset = offset + end;
+  return { content: buffer.toString("utf8", 0, end), nextOffset, truncated: nextOffset < fileSize };
+}
+
+/** Handles file GET requests for remote workspaces (Option B1: list/meta/text read). */
+async function handleRemoteFileGet(
+  resolved: { target: import("@/lib/remote-fs").RemoteFsTarget["target"]; remotePath: string },
+  filePath: string,
+  type: FileRequestType,
+  request: NextRequest,
+): Promise<NextResponse | Response> {
+  if (type === "list") {
+    const stat = await remoteStat(resolved.target, resolved.remotePath);
+    if (!stat?.isDirectory) {
+      return NextResponse.json({ error: "Not a directory" }, { status: 400 });
+    }
+    const remoteEntries = await remoteListDir(resolved.target, resolved.remotePath);
+    const entries = remoteEntries
+      .filter((entry) => !IGNORED_NAMES.has(entry.name) && !IGNORED_SUFFIXES.some((suffix) => entry.name.endsWith(suffix)))
+      .sort((a, b) => {
+        if (a.isDir !== b.isDir) return a.isDir ? -1 : 1;
+        return a.name.localeCompare(b.name);
+      });
+    return NextResponse.json({ entries, path: filePath });
+  }
+
+  if (type === "meta") {
+    const stat = await remoteStat(resolved.target, resolved.remotePath);
+    if (!stat?.isFile) {
+      return NextResponse.json({ error: "Not a file" }, { status: 400 });
+    }
+    const imageMime = getImageMime(filePath);
+    const audioMime = getAudioMime(filePath);
+    const videoMime = getVideoMime(filePath);
+    const documentMime = getDocumentMime(filePath);
+    return NextResponse.json({
+      size: stat.size,
+      language: getLanguage(filePath),
+      mime: imageMime || audioMime || videoMime || documentMime || "text/plain",
+      previewKind: documentPreviewKind(filePath),
+    });
+  }
+
+  if (type === "read") {
+    const stat = await remoteStat(resolved.target, resolved.remotePath);
+    if (!stat?.isFile) {
+      return NextResponse.json({ error: "Not a file" }, { status: 400 });
+    }
+    // Binary preview (image/audio/video/document) is not supported remotely yet.
+    if (getImageMime(filePath) || getAudioMime(filePath) || getVideoMime(filePath) || getDocumentMime(filePath)) {
+      return NextResponse.json({ error: "远程二进制文件预览暂未支持" }, { status: 501 });
+    }
+    const rawOffset = request.nextUrl.searchParams.get("offset");
+    if (rawOffset !== null && !/^\d+$/.test(rawOffset)) {
+      return NextResponse.json({ error: "Invalid text preview offset" }, { status: 400 });
+    }
+    const offset = Number(rawOffset ?? 0);
+    if (!Number.isSafeInteger(offset) || offset > stat.size) {
+      return NextResponse.json({ error: "Invalid text preview offset" }, { status: 400 });
+    }
+    const buffer = await remoteReadBounded(
+      resolved.target,
+      resolved.remotePath,
+      offset,
+      Math.min(TEXT_PREVIEW_MAX_BYTES + 1, stat.size - offset),
+    );
+    const chunk = textChunkFromBuffer(buffer, stat.size, offset);
+    return NextResponse.json({ ...chunk, language: getLanguage(filePath), size: stat.size });
+  }
+
+  return NextResponse.json({ error: "远程文件操作暂未支持" }, { status: 501 });
 }
 
 async function getUploadDirectory(segments: string[]): Promise<
@@ -427,6 +516,13 @@ export async function GET(
     if (!type) {
       return NextResponse.json({ error: "Invalid file request type" }, { status: 400 });
     }
+
+    // Remote workspaces route file reads through SSH instead of the local fs.
+    const remoteFile = await resolveRemoteFile(filePath);
+    if (remoteFile) {
+      return handleRemoteFileGet(remoteFile, filePath, type, request);
+    }
+
     const sessionId = request.nextUrl.searchParams.get("sessionId");
 
     const allowedRoots = await getAllowedFileRoots();

@@ -160,6 +160,15 @@ export async function attachSessionProjectInfo(sessions: SessionInfo[]): Promise
   }));
 
   return sessions.map((session) => {
+    // Remote workspaces are not local paths: keep the remote identity instead of
+    // resolving git/project metadata against the local anchor directory.
+    if (session.remoteWorkspace) {
+      return {
+        ...session,
+        projectRoot: session.remoteWorkspace.label,
+        projectKey: session.remoteWorkspace.workspaceKey,
+      };
+    }
     const project = session.cwd ? projectByCwd.get(session.cwd) : undefined;
     const projectRoot = project?.projectRoot ?? session.cwd;
     return {
@@ -231,6 +240,7 @@ function mapScannedSession(
         : {}),
     transient: false,
     ...(detailsPending ? { detailsPending: true } : {}),
+    ...(scanned.remoteWorkspace ? { remoteWorkspace: scanned.remoteWorkspace } : {}),
   };
 }
 

@@ -2,6 +2,7 @@
 
 import { useEffect, useLayoutEffect, useState, useCallback, useMemo, useRef, type CSSProperties, type ReactNode } from "react";
 import type { SessionInfo } from "@/lib/types";
+import type { RemoteWorkspace } from "@/lib/remote-workspace";
 import { listSessionFamilies } from "@/lib/session-family";
 import { loadExplorerOpen, saveExplorerOpen } from "@/lib/file-explorer-state";
 import { dispatchSessionRowContextMenu } from "@/lib/session-row-context-menu";
@@ -120,6 +121,8 @@ interface Props {
     projectRoot?: string | null,
     projectKey?: string | null,
   ) => void;
+  /** Fired when a remote (SSH) workspace is committed from the directory picker. */
+  onRemoteWorkspaceChange?: (remote: RemoteWorkspace) => void;
   onOpenFile?: (filePath: string, fileName: string, options?: { sourceSessionId?: string | null; modeHint?: "diff" }) => void;
   onOpenTerminal?: (cwd: string) => void;
   explorerRefreshKey?: number;
@@ -382,7 +385,7 @@ function PiWebTitle() {
   );
 }
 
-export function SessionSidebar({ selectedSessionId, onSelectSession, onNewSession, initialSessionId, skipInitialProjectSelection, onInitialRestoreDone, refreshKey, onSessionDeleted, selectedCwd: selectedCwdProp, onCwdChange, onOpenFile, onOpenTerminal, explorerRefreshKey, onExplorerRefresh, onAtMention, onAtMentions, onBackgroundTaskDone, onRunningSessionIdsChange, onSessionsChange }: Props) {
+export function SessionSidebar({ selectedSessionId, onSelectSession, onNewSession, initialSessionId, skipInitialProjectSelection, onInitialRestoreDone, refreshKey, onSessionDeleted, selectedCwd: selectedCwdProp, onCwdChange, onRemoteWorkspaceChange, onOpenFile, onOpenTerminal, explorerRefreshKey, onExplorerRefresh, onAtMention, onAtMentions, onBackgroundTaskDone, onRunningSessionIdsChange, onSessionsChange }: Props) {
   const { t } = useI18n();
   const [allSessions, setAllSessions] = useState<SessionInfo[]>([]);
   // Tracked in a ref only: the version is compared against the polled value to
@@ -401,6 +404,7 @@ export function SessionSidebar({ selectedSessionId, onSelectSession, onNewSessio
   const [customPathError, setCustomPathError] = useState<string | null>(null);
   const [customPathValidating, setCustomPathValidating] = useState(false);
   const [validatedProject, setValidatedProject] = useState<ValidatedProject | null>(null);
+  const [validatedRemoteProject, setValidatedRemoteProject] = useState<ProjectSelection | null>(null);
   const dropdownRef = useRef<HTMLDivElement>(null);
   // Worktree switcher state
   const [worktreeState, setWorktreeState] = useState<WorktreeState | null>(null);
@@ -743,6 +747,15 @@ export function SessionSidebar({ selectedSessionId, onSelectSession, onNewSessio
     if (validatedProject?.cwd === cwd) {
       return projectSelection(validatedProject.root, validatedProject.key);
     }
+    if (validatedRemoteProject?.key === cwd) {
+      return projectSelection(validatedRemoteProject.root, validatedRemoteProject.key);
+    }
+    // Remote workspaces: the local anchor dir is not a real project, so the
+    // session's remote identity must win over worktree/project resolution.
+    const remoteMatch = allSessions.find((session) => session.remoteWorkspace && session.cwd === cwd);
+    if (remoteMatch?.remoteWorkspace) {
+      return projectSelection(remoteMatch.remoteWorkspace.label, workspaceKeyOf(remoteMatch));
+    }
     if (worktreeState && worktreeState.forCwd === cwd) {
       return projectSelection(worktreeState.projectRoot, worktreeState.projectKey);
     }
@@ -752,12 +765,18 @@ export function SessionSidebar({ selectedSessionId, onSelectSession, onNewSessio
       return projectSelection(worktreeState.projectRoot, worktreeState.projectKey);
     }
     const match = allSessions.find((session) => (
-      session.cwd === cwd || (session.projectRoot ?? session.cwd) === cwd
+      session.cwd === cwd
+      || (session.projectRoot ?? session.cwd) === cwd
+      || session.projectKey === cwd
+      || session.remoteWorkspace?.workspaceKey === cwd
     ));
     return match
-      ? projectSelection(match.projectRoot ?? match.cwd, workspaceKeyOf(match))
+      ? projectSelection(
+          match.remoteWorkspace?.label ?? match.projectRoot ?? match.cwd,
+          workspaceKeyOf(match),
+        )
       : projectSelection(cwd, cwd);
-  }, [validatedProject, worktreeState, allSessions, projectSelection]);
+  }, [validatedProject, validatedRemoteProject, worktreeState, allSessions, projectSelection]);
 
   // A worktree/session refresh can hydrate the stable key without changing
   // cwd, so notify when either changes. The parent treats same-cwd key changes
@@ -897,6 +916,15 @@ export function SessionSidebar({ selectedSessionId, onSelectSession, onNewSessio
       setCustomPathValidating(false);
     }
   }, [customPathValue, customPathValidating]);
+
+  const commitCustomRemote = useCallback((remote: RemoteWorkspace) => {
+    setValidatedRemoteProject({ root: remote.label, key: remote.workspaceKey });
+    setSelectedCwd(remote.workspaceKey);
+    setCustomPathOpen(false);
+    setDropdownOpen(false);
+    setCustomPathError(null);
+    onRemoteWorkspaceChange?.(remote);
+  }, [onRemoteWorkspaceChange]);
 
   const handleCustomPathClick = useCallback(() => {
     setCustomPathOpen(true);
@@ -1117,6 +1145,7 @@ export function SessionSidebar({ selectedSessionId, onSelectSession, onNewSessio
             setCustomPathError(null);
           }}
           onSelect={(path) => void commitCustomPath(path)}
+          onSelectRemote={commitCustomRemote}
         />
       )}
       {/* Header */}

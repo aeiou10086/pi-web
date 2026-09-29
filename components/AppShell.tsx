@@ -55,6 +55,8 @@ import {
   SIDEBAR_MIN_WIDTH,
 } from "@/lib/panel-layout";
 import type { BlockingExtensionUiRequest, SessionInfo, SessionTreeNode } from "@/lib/types";
+import type { RemoteWorkspace } from "@/lib/remote-workspace";
+import { isRemoteWorkspaceKey } from "@/lib/remote-workspace-key";
 import type { ProjectTrustStatus } from "@/lib/api-types";
 import type { ChatInputHandle } from "./ChatInput";
 import type { SessionStatsInfo } from "@/lib/pi-types";
@@ -94,7 +96,7 @@ export function AppShell() {
   useEffect(() => {
     if (typeof window === "undefined" || !("Notification" in window)) return;
     if (Notification.permission !== "granted") return;
-    void setupPushSubscription(locale);
+    void setupPushSubscription(locale).catch(() => {});
   }, [locale]);
   // Audio ownership lives here (not in ChatWindow) so the completion tone can
   // also fire for tasks finishing in a non-active workspace whose ChatWindow
@@ -154,6 +156,7 @@ export function AppShell() {
   }, []);
   // The temporary id distinguishes consecutive fresh composers in one cwd.
   const [newSessionCwd, setNewSessionCwd] = useState<string | null>(null);
+  const [newSessionRemote, setNewSessionRemote] = useState<RemoteWorkspace | null>(null);
   const [newSessionDraftId, setNewSessionDraftId] = useState("initial");
   const activeNewSessionDraftKeyRef = useRef<string | null>(null);
   const [initialCwdStatus, setInitialCwdStatus] = useState<"idle" | "validating" | "ready" | "error">(
@@ -657,12 +660,60 @@ export function AppShell() {
       });
   }, [router, sessionCatalog]);
 
+  const resolveRemoteWorkspace = useCallback((cwd: string | null | undefined, projectKey?: string | null): RemoteWorkspace | null => {
+    if (!cwd && !projectKey) return null;
+    const session = sessionCatalog.find((s) => s.remoteWorkspace && (
+      s.remoteWorkspace.workspaceKey === projectKey
+      || s.projectKey === projectKey
+      || s.cwd === cwd
+    ));
+    if (!session?.remoteWorkspace) return null;
+    return { ...session.remoteWorkspace, anchorDir: session.remoteWorkspace.anchorDir ?? session.cwd };
+  }, [sessionCatalog]);
+
+  const applyRemoteWorkspaceSwitch = useCallback((remote: RemoteWorkspace) => {
+    invalidateWorkspaceRestore();
+    const anchorDir = remote.anchorDir ?? remote.workspaceKey;
+    setNewSessionRemote(remote);
+    setActiveCwd(anchorDir);
+    activeProjectKeyRef.current = remote.workspaceKey;
+    setSelectedSession(null);
+    setNewSessionCwd(anchorDir);
+    setSessionKey((k) => k + 1);
+    setBranchTree([]);
+    setBranchActiveLeafId(null);
+    setSystemPrompt(null);
+    setSystemTools(null);
+    setSystemInfoLoading(false);
+    setActiveTopPanel(null);
+    setFileTabs([]);
+    setActiveFileTabId(null);
+    setRightPanelOpen(false);
+    const draftId = typeof crypto.randomUUID === "function"
+      ? crypto.randomUUID()
+      : `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
+    const draftKey = `new:${draftId}:${remote.workspaceKey}`;
+    setNewSessionDraftId(draftId);
+    activeNewSessionDraftKeyRef.current = draftKey;
+    router.replace(typeof window !== "undefined" ? window.location.pathname : "/", { scroll: false });
+  }, [invalidateWorkspaceRestore, router]);
+
   const handleCwdChange = useCallback((
     cwd: string | null,
     projectRoot?: string | null,
     projectKey?: string | null,
   ) => {
     invalidateWorkspaceRestore();
+    // A remote key arriving here is the sidebar re-notifying — owned by
+    // applyRemoteWorkspaceSwitch. A remote project selected via the dropdown
+    // arrives as (remote label, workspaceKey), so resolve and delegate too.
+    if (cwd && isRemoteWorkspaceKey(cwd)) return;
+    const remote = resolveRemoteWorkspace(cwd, projectKey);
+    if (remote) {
+      applyRemoteWorkspaceSwitch(remote);
+      return;
+    }
+    setNewSessionRemote(null);
     const currentFreshCwd = newSessionCwd ?? activeCwd;
     setActiveCwd(cwd);
     // Skip if cwd is null (initial mount).
@@ -728,11 +779,12 @@ export function AppShell() {
       restoreWorkspaceContext(newProject, cwd);
     }
     router.replace(typeof window !== "undefined" ? window.location.pathname : "/", { scroll: false });
-  }, [activeCwd, activeFileTabId, invalidateWorkspaceRestore, newSessionCwd, router, selectedSession, restoreWorkspaceContext]);
+  }, [activeCwd, activeFileTabId, invalidateWorkspaceRestore, newSessionCwd, router, selectedSession, restoreWorkspaceContext, resolveRemoteWorkspace, applyRemoteWorkspaceSwitch]);
 
   const handleSelectSession = useCallback((session: SessionInfo, isRestore = false, entryId?: string, blockIndex?: number) => {
     setSearchTarget(entryId ? { sessionId: session.id, entryId, blockIndex } : null);
     invalidateWorkspaceRestore();
+    setNewSessionRemote(null);
     const activeDraftKey = activeNewSessionDraftKeyRef.current;
     const activeDraftCwd = newSessionCwd ?? (selectedSession === null ? activeCwd : null);
     if (activeDraftKey && activeDraftCwd) {
@@ -796,6 +848,7 @@ export function AppShell() {
     setNewSessionDraftId(sessionId);
     setSelectedSession(null);
     setNewSessionCwd(cwd);
+    setNewSessionRemote(resolveRemoteWorkspace(cwd, null));
     setSessionKey((k) => k + 1);
     setBranchTree([]);
     setBranchActiveLeafId(null);
@@ -805,7 +858,7 @@ export function AppShell() {
     setActiveTopPanel(null);
     if (isMobile) setSidebarOpen(false);
     router.replace(`?cwd=${encodeURIComponent(cwd)}`, { scroll: false });
-  }, [invalidateWorkspaceRestore, router, isMobile]);
+  }, [invalidateWorkspaceRestore, router, isMobile, resolveRemoteWorkspace]);
 
   // Global keyboard shortcuts (handles Esc, Ctrl+Alt+N etc.)
   useGlobalKeyboardShortcuts({
@@ -857,6 +910,7 @@ export function AppShell() {
     invalidateWorkspaceRestore();
     activeNewSessionDraftKeyRef.current = null;
     setNewSessionCwd(null);
+    setNewSessionRemote(null);
     setSelectedSession(session);
     hydrateSelectedSession(session.id);
     router.replace(`?session=${encodeURIComponent(session.id)}`, { scroll: false });
@@ -891,12 +945,12 @@ export function AppShell() {
 
     if (Notification.permission === "granted") {
       fire();
-      void setupPushSubscription(locale);
+      void setupPushSubscription(locale).catch(() => {});
     } else if (Notification.permission === "default") {
       void Notification.requestPermission().then((p) => {
         if (p === "granted") {
           fire();
-          void setupPushSubscription(locale);
+          void setupPushSubscription(locale).catch(() => {});
         }
       });
     }
@@ -1159,7 +1213,8 @@ export function AppShell() {
   }, [projectTrustBusy, projectTrustCwd]);
 
   const activeFileTab = fileTabs.find((tab) => tab.id === activeFileTabId) ?? null;
-  const activeCwdName = activeCwd ? getFileName(activeCwd) || activeCwd : null;
+  const remoteWorkspaceActive = newSessionRemote ?? selectedSession?.remoteWorkspace ?? null;
+  const activeCwdName = remoteWorkspaceActive?.label ?? (activeCwd ? getFileName(activeCwd) || activeCwd : null);
   const windowTitle = activeCwdName ? `${activeCwdName} - Pi Web` : "Pi Web";
 
   useEffect(() => {
@@ -1186,6 +1241,7 @@ export function AppShell() {
         onSessionDeleted={handleSessionDeleted}
         selectedCwd={selectedSession?.cwd ?? newSessionCwd ?? null}
         onCwdChange={handleCwdChange}
+        onRemoteWorkspaceChange={applyRemoteWorkspaceSwitch}
         onOpenFile={handleOpenFile}
         onOpenTerminal={handleOpenTerminal}
         explorerRefreshKey={explorerRefreshKey}
@@ -2316,6 +2372,7 @@ export function AppShell() {
               onScrollPositionChange={handleSessionScrollPositionChange}
               sessionRunning={Boolean(selectedSession && runningSessionIds.has(selectedSession.id))}
               newSessionCwd={effectiveNewSessionCwd}
+              newSessionRemote={newSessionRemote}
               newSessionDraftKey={newSessionDraftKey}
               onAgentEnd={handleAgentEnd}
               onAttentionNeeded={handleAttentionNeeded}

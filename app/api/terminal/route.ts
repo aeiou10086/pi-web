@@ -2,6 +2,7 @@ import { stat } from "fs/promises";
 import { resolve } from "path";
 import { NextResponse } from "next/server";
 import { getAllowedFileRoots, isExistingFilePathAllowed } from "@/lib/file-access";
+import { resolveRemoteFile } from "@/lib/remote-fs";
 import { createTerminal } from "@/lib/terminal-manager";
 
 export const dynamic = "force-dynamic";
@@ -24,11 +25,19 @@ export async function POST(req: Request) {
     if (!isExistingFilePathAllowed(cwd, roots)) {
       return NextResponse.json({ error: "Access denied" }, { status: 403 });
     }
+    const remote = await resolveRemoteFile(cwd);
     const id = createTerminal(
       cwd,
       typeof body.cols === "number" ? body.cols : 80,
       typeof body.rows === "number" ? body.rows : 24,
       body.id as string | undefined,
+      remote ? {
+        host: remote.target.host,
+        port: remote.target.port,
+        username: remote.target.username,
+        ...(remote.target.identityFile ? { identityFile: remote.target.identityFile } : {}),
+        remotePath: remote.remotePath,
+      } : undefined,
     );
     return NextResponse.json({ id });
   } catch (error) {

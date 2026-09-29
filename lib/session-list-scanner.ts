@@ -11,6 +11,7 @@ import { basename, join } from "node:path";
 import { createInterface } from "node:readline";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import { writePrivateFileAtomicSync } from "./atomic-file";
+import { parseRemoteWorkspaceData, REMOTE_WORKSPACE_ENTRY_TYPE, type RemoteWorkspace } from "./remote-workspace";
 
 export interface ScannedSessionInfo {
 	path: string;
@@ -24,6 +25,7 @@ export interface ScannedSessionInfo {
 	parentSessionPath?: string;
 	/** True when only header/stat metadata was available for this listing. */
 	detailsPending?: boolean;
+	remoteWorkspace?: RemoteWorkspace;
 }
 
 interface Fingerprint {
@@ -139,6 +141,11 @@ function extractTextContent(message: RawEntry): string {
 		.join(" ");
 }
 
+function readRemoteWorkspaceEntry(entry: RawEntry): RemoteWorkspace | undefined {
+	if (entry.type !== "custom" || entry.customType !== REMOTE_WORKSPACE_ENTRY_TYPE) return undefined;
+	return parseRemoteWorkspaceData(entry.data);
+}
+
 function activityTimeOf(entry: RawEntry): number | undefined {
 	const message = entry.message as RawEntry | undefined;
 	if (
@@ -165,6 +172,7 @@ export async function scanSessionFileInfo(
 		let messageCount = 0;
 		let firstMessage = "";
 		let lastActivityTime: number | undefined;
+		let remoteWorkspace: RemoteWorkspace | undefined;
 
 		const rl = createInterface({
 			input: createReadStream(filePath, { encoding: "utf8" }),
@@ -187,6 +195,7 @@ export async function scanSessionFileInfo(
 						? entry.name.trim()
 						: undefined;
 			}
+			remoteWorkspace ??= readRemoteWorkspaceEntry(entry);
 			if (entry.type !== "message") continue;
 			messageCount++;
 
@@ -237,6 +246,7 @@ export async function scanSessionFileInfo(
 			modified,
 			messageCount,
 			firstMessage: firstMessage || "(no messages)",
+			...(remoteWorkspace ? { remoteWorkspace } : {}),
 		};
 	} catch {
 		return null;
@@ -319,6 +329,7 @@ function loadPersistedIndex(): void {
 			const created = new Date(info.created);
 			const modified = new Date(info.modified);
 			if (!Number.isFinite(created.getTime()) || !Number.isFinite(modified.getTime())) continue;
+			const remoteWorkspace = parseRemoteWorkspaceData(info.remoteWorkspace);
 			index.set(pathKey, {
 				fp: { size: fp.size, mtimeMs: fp.mtimeMs },
 				info: {
@@ -331,6 +342,7 @@ function loadPersistedIndex(): void {
 					messageCount: info.messageCount,
 					created,
 					modified,
+					...(remoteWorkspace ? { remoteWorkspace } : {}),
 				},
 			});
 		}

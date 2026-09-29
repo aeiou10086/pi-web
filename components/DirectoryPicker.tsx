@@ -1,8 +1,9 @@
 "use client";
 
-import { FormEvent, useCallback, useEffect, useState } from "react";
+import { FormEvent, useCallback, useEffect, useState, type CSSProperties } from "react";
 import { createPortal } from "react-dom";
 import { useI18n } from "@/hooks/useI18n";
+import type { RemoteWorkspace } from "@/lib/remote-workspace";
 
 interface DirectoryEntry {
   name: string;
@@ -47,15 +48,23 @@ function isWindowsDriveRoot(directory: string): boolean {
   return /^[a-zA-Z]:[\\/]?$/.test(directory);
 }
 
+interface SavedEndpoint {
+  key: string;
+  sshCommand?: string;
+  remoteCwd?: string;
+  note?: string;
+}
+
 interface Props {
   onCancel: () => void;
   onSelect: (path: string) => void;
+  onSelectRemote?: (remote: RemoteWorkspace) => void;
   initialPath?: string;
   busy?: boolean;
   error?: string | null;
 }
 
-export function DirectoryPicker({ onCancel, onSelect, initialPath, busy = false, error }: Props) {
+export function DirectoryPicker({ onCancel, onSelect, onSelectRemote, initialPath, busy = false, error }: Props) {
   const { t } = useI18n();
   const [portalTarget, setPortalTarget] = useState<HTMLElement | null>(null);
   const [currentPath, setCurrentPath] = useState("");
@@ -65,6 +74,108 @@ export function DirectoryPicker({ onCancel, onSelect, initialPath, busy = false,
   const [drives, setDrives] = useState<DirectoryEntry[] | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
+
+  const [mode, setMode] = useState<"local" | "remote">("local");
+  const [endpoints, setEndpoints] = useState<SavedEndpoint[]>([]);
+  const [endpointsLoading, setEndpointsLoading] = useState(false);
+  const [remoteBusy, setRemoteBusy] = useState(false);
+  const [remoteError, setRemoteError] = useState<string | null>(null);
+  const [selectedEndpoint, setSelectedEndpoint] = useState<string | null>(null);
+  const [aliasInput, setAliasInput] = useState("");
+  const [hostInput, setHostInput] = useState("");
+  const [portInput, setPortInput] = useState("");
+  const [usernameInput, setUsernameInput] = useState("root");
+  const [identityInput, setIdentityInput] = useState("");
+  const [remoteCwdInput, setRemoteCwdInput] = useState("");
+  const [remoteBrowseOpen, setRemoteBrowseOpen] = useState(false);
+  const [remoteBrowsePath, setRemoteBrowsePath] = useState("/");
+  const [remoteBrowseParent, setRemoteBrowseParent] = useState<string | null>(null);
+  const [remoteBrowseDirs, setRemoteBrowseDirs] = useState<{ name: string; path: string }[]>([]);
+  const [remoteBrowseLoading, setRemoteBrowseLoading] = useState(false);
+  const [remoteBrowseError, setRemoteBrowseError] = useState<string | null>(null);
+
+  const switchMode = useCallback((next: "local" | "remote") => {
+    setMode(next);
+    setRemoteError(null);
+    if (next === "remote" && endpoints.length === 0 && !endpointsLoading) {
+      setEndpointsLoading(true);
+      void fetch("/api/remote/endpoints")
+        .then((r) => r.json().catch(() => ({})))
+        .then((d: { endpoints?: SavedEndpoint[] }) => setEndpoints(d.endpoints ?? []))
+        .catch(() => setEndpoints([]))
+        .finally(() => setEndpointsLoading(false));
+    }
+  }, [endpoints.length, endpointsLoading]);
+
+  const submitRemote = useCallback(async (event?: FormEvent<HTMLFormElement>) => {
+    event?.preventDefault();
+    if (remoteBusy) return;
+    setRemoteBusy(true);
+    setRemoteError(null);
+    const endpoint = endpoints.find((e) => e.key === selectedEndpoint);
+    const cwd = remoteCwdInput.trim() || endpoint?.remoteCwd || "~";
+    const body: Record<string, unknown> = endpoint?.sshCommand
+      ? { command: endpoint.sshCommand, cwd }
+      : {
+          ...(aliasInput.trim() ? { alias: aliasInput.trim() } : { host: hostInput.trim() }),
+          ...(portInput.trim() ? { port: Number(portInput.trim()) } : {}),
+          ...(usernameInput.trim() ? { username: usernameInput.trim() } : {}),
+          ...(identityInput.trim() ? { identityFile: identityInput.trim() } : {}),
+          cwd,
+        };
+    try {
+      const res = await fetch("/api/remote/validate", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      const data = await res.json().catch(() => ({})) as { remote?: RemoteWorkspace; error?: string };
+      if (!res.ok || !data.remote) {
+        setRemoteError(data.error ?? `HTTP ${res.status}`);
+        return;
+      }
+      onSelectRemote?.(data.remote);
+    } catch (e) {
+      setRemoteError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setRemoteBusy(false);
+    }
+  }, [aliasInput, endpoints, hostInput, identityInput, onSelectRemote, portInput, remoteBusy, remoteCwdInput, selectedEndpoint, usernameInput]);
+
+  const browseRemote = useCallback(async (path: string) => {
+    if (remoteBrowseLoading) return;
+    setRemoteBrowseLoading(true);
+    setRemoteBrowseError(null);
+    const endpoint = endpoints.find((e) => e.key === selectedEndpoint);
+    const body: Record<string, unknown> = endpoint?.sshCommand
+      ? { command: endpoint.sshCommand, path }
+      : {
+          ...(aliasInput.trim() ? { alias: aliasInput.trim() } : { host: hostInput.trim() }),
+          ...(portInput.trim() ? { port: Number(portInput.trim()) } : {}),
+          ...(usernameInput.trim() ? { username: usernameInput.trim() } : {}),
+          ...(identityInput.trim() ? { identityFile: identityInput.trim() } : {}),
+          path,
+        };
+    try {
+      const res = await fetch("/api/remote/browse", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      const data = await res.json().catch(() => ({})) as { path?: string; parentPath?: string | null; directories?: { name: string; path: string }[]; error?: string };
+      if (!res.ok || data.error) {
+        setRemoteBrowseError(data.error ?? `HTTP ${res.status}`);
+        return;
+      }
+      setRemoteBrowsePath(data.path ?? path);
+      setRemoteBrowseParent(data.parentPath ?? null);
+      setRemoteBrowseDirs(data.directories ?? []);
+    } catch (e) {
+      setRemoteBrowseError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setRemoteBrowseLoading(false);
+    }
+  }, [aliasInput, endpoints, hostInput, identityInput, portInput, remoteBrowseLoading, selectedEndpoint, usernameInput]);
 
   const navigateTo = useCallback(async (directory?: string) => {
     setLoading(true);
@@ -97,6 +208,11 @@ export function DirectoryPicker({ onCancel, onSelect, initialPath, busy = false,
   const hasUncommittedPath = pathInput.trim() !== currentPath;
   const canSelect = Boolean(currentPath) && !hasUncommittedPath && !busy;
   const canNavigateUp = Boolean(parentDirectory) || isWindowsDriveRoot(currentPath);
+  const fieldStyle: CSSProperties = {
+    minWidth: 0, height: 34, padding: "0 10px", border: "1px solid var(--border)",
+    borderRadius: 6, outline: "none", background: "var(--bg-panel)", color: "var(--text)",
+    fontFamily: "var(--font-mono)", fontSize: 12,
+  };
 
   if (!portalTarget) return null;
 
@@ -131,6 +247,100 @@ export function DirectoryPicker({ onCancel, onSelect, initialPath, busy = false,
           </button>
         </div>
 
+        <div style={{ display: "flex", gap: 6, flexShrink: 0, padding: "10px 14px 0" }}>
+          <button
+            type="button"
+            onClick={() => switchMode("local")}
+            style={{ flex: 1, padding: "6px 0", border: "1px solid var(--border)", borderRadius: 6, background: mode === "local" ? "var(--accent)" : "var(--bg-panel)", color: mode === "local" ? "var(--accent-contrast)" : "var(--text-muted)", fontSize: 12, fontWeight: 600, cursor: "pointer" }}
+          >
+            {t("directoryPicker.selectDirectory")}
+          </button>
+          {onSelectRemote && (
+            <button
+              type="button"
+              onClick={() => switchMode("remote")}
+              style={{ flex: 1, padding: "6px 0", border: "1px solid var(--border)", borderRadius: 6, background: mode === "remote" ? "var(--accent)" : "var(--bg-panel)", color: mode === "remote" ? "var(--accent-contrast)" : "var(--text-muted)", fontSize: 12, fontWeight: 600, cursor: "pointer" }}
+            >
+              SSH 远程
+            </button>
+          )}
+        </div>
+
+        {mode === "remote" && (
+          <div style={{ display: "flex", flexDirection: "column", flex: 1, minHeight: 0, overflow: "auto", padding: "10px 14px", gap: 8 }}>
+            {endpointsLoading ? (
+              <div style={{ color: "var(--text-dim)", fontSize: 11 }}>加载已保存的远程端点…</div>
+            ) : endpoints.length > 0 ? (
+              <div>
+                <div style={{ color: "var(--text-muted)", fontSize: 11, marginBottom: 6 }}>已保存的远程端点</div>
+                {endpoints.map((endpoint) => (
+                  <button
+                    key={endpoint.key}
+                    type="button"
+                    onClick={() => {
+                      setSelectedEndpoint(endpoint.key);
+                      if (endpoint.remoteCwd) setRemoteCwdInput(endpoint.remoteCwd);
+                    }}
+                    style={{ width: "100%", textAlign: "left", padding: "6px 8px", marginBottom: 4, border: "1px solid var(--border)", borderRadius: 5, background: selectedEndpoint === endpoint.key ? "var(--bg-hover)" : "none", color: "var(--text)", cursor: "pointer", fontSize: 11, fontFamily: "var(--font-mono)" }}
+                  >
+                    <span style={{ fontWeight: 600 }}>{endpoint.key}</span>
+                    {endpoint.note ? <span style={{ color: "var(--text-dim)" }}> · {endpoint.note}</span> : null}
+                    {endpoint.remoteCwd ? <span style={{ color: "var(--text-dim)" }}> · {endpoint.remoteCwd}</span> : null}
+                  </button>
+                ))}
+              </div>
+            ) : null}
+
+            <form onSubmit={(event) => void submitRemote(event)} style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+              <input type="text" value={aliasInput} onChange={(event) => setAliasInput(event.target.value)} placeholder="ssh 别名（~/.ssh/config，可选）" style={fieldStyle} />
+              <input type="text" value={hostInput} onChange={(event) => setHostInput(event.target.value)} placeholder="主机 IP / 域名" style={fieldStyle} />
+              <div style={{ display: "flex", gap: 6 }}>
+                <input type="text" value={usernameInput} onChange={(event) => setUsernameInput(event.target.value)} placeholder="用户" style={{ ...fieldStyle, flex: 1 }} />
+                <input type="text" value={portInput} onChange={(event) => setPortInput(event.target.value)} placeholder="端口" style={{ ...fieldStyle, width: 70 }} />
+              </div>
+              <input type="text" value={identityInput} onChange={(event) => setIdentityInput(event.target.value)} placeholder="私钥路径（可选，默认用默认密钥）" style={fieldStyle} />
+              <input type="text" value={remoteCwdInput} onChange={(event) => setRemoteCwdInput(event.target.value)} placeholder="远端工作目录（留空用默认，如 /root）" style={fieldStyle} />
+              <div style={{ display: "flex", gap: 6 }}>
+                <button type="button" onClick={() => {
+                  const opening = !remoteBrowseOpen;
+                  setRemoteBrowseOpen(opening);
+                  if (opening) void browseRemote(remoteBrowsePath === "/" && remoteCwdInput.trim().startsWith("/") ? remoteCwdInput.trim() : remoteBrowsePath);
+                }} style={{ flex: 1, padding: "5px 8px", border: "1px solid var(--border)", borderRadius: 6, background: "none", color: "var(--text-muted)", fontSize: 11, cursor: "pointer" }}>
+                  {remoteBrowseOpen ? "收起浏览" : "浏览远端目录"}
+                </button>
+              </div>
+              {remoteBrowseOpen && (
+                <div style={{ border: "1px solid var(--border)", borderRadius: 6, padding: 6, display: "flex", flexDirection: "column", gap: 4, maxHeight: 170, overflowY: "auto" }}>
+                  <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                    <button type="button" onClick={() => void browseRemote(remoteBrowseParent ?? "/")} disabled={!remoteBrowseParent || remoteBrowseLoading} style={{ width: 24, height: 24, border: "1px solid var(--border)", borderRadius: 5, background: "var(--bg-hover)", color: "var(--text-muted)", cursor: remoteBrowseParent && !remoteBrowseLoading ? "pointer" : "default", opacity: remoteBrowseParent && !remoteBrowseLoading ? 1 : 0.45, fontSize: 12 }}>↑</button>
+                    <span style={{ flex: 1, fontFamily: "var(--font-mono)", fontSize: 11, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", color: "var(--text)" }}>{remoteBrowsePath}</span>
+                    <button type="button" onClick={() => { setRemoteCwdInput(remoteBrowsePath); setRemoteBrowseOpen(false); }} style={{ padding: "3px 8px", border: "1px solid var(--accent)", borderRadius: 5, background: "none", color: "var(--accent)", fontSize: 11, cursor: "pointer" }}>选此目录</button>
+                  </div>
+                  {remoteBrowseLoading ? (
+                    <div style={{ fontSize: 11, color: "var(--text-dim)" }}>加载中…</div>
+                  ) : remoteBrowseError ? (
+                    <div style={{ fontSize: 11, color: "#dc2626" }}>{remoteBrowseError}</div>
+                  ) : remoteBrowseDirs.length === 0 ? (
+                    <div style={{ fontSize: 11, color: "var(--text-dim)" }}>无子目录</div>
+                  ) : (
+                    remoteBrowseDirs.map((dir) => (
+                      <button key={dir.path} type="button" onClick={() => void browseRemote(dir.path)} style={{ width: "100%", textAlign: "left", padding: "4px 8px", border: "1px solid transparent", borderRadius: 5, background: "none", color: "var(--text-muted)", cursor: "pointer", fontSize: 11, fontFamily: "var(--font-mono)" }}>
+                        📁 {dir.name}
+                      </button>
+                    ))
+                  )}
+                </div>
+              )}
+              {remoteError && <div style={{ color: "#dc2626", fontSize: 11 }}>{remoteError}</div>}
+              <button type="submit" disabled={remoteBusy} style={{ padding: "7px 12px", border: 0, borderRadius: 6, background: "var(--accent)", color: "var(--accent-contrast)", fontSize: 13, fontWeight: 600, opacity: remoteBusy ? 0.6 : 1, cursor: remoteBusy ? "default" : "pointer" }}>
+                {remoteBusy ? "连接中…" : "连接并打开远程工作区"}
+              </button>
+            </form>
+          </div>
+        )}
+
+        {mode === "local" && (
+        <>
         <form onSubmit={handlePathSubmit} style={{ display: "flex", alignItems: "center", gap: 8, flexShrink: 0, padding: "10px 14px", borderBottom: "1px solid var(--border)" }}>
           <button className="directory-picker-back" type="button" onClick={() => void navigateTo(parentDirectory ?? undefined)} disabled={loading || !canNavigateUp} title={t("directoryPicker.goToParent")} aria-label={t("directoryPicker.goToParent")} style={{ width: 36, height: 36, padding: 0, display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0, border: "1px solid var(--border)", borderRadius: 6, background: "var(--bg-hover)", color: "var(--text-muted)", cursor: canNavigateUp ? "pointer" : "default", opacity: canNavigateUp ? 1 : 0.45 }}>
             <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
@@ -208,9 +418,12 @@ export function DirectoryPicker({ onCancel, onSelect, initialPath, busy = false,
           )}
           {(loadError || error) && <div style={{ padding: "8px", color: "#dc2626", fontSize: 11 }}>{loadError ?? error}</div>}
         </div>
+        </>
+        )}
 
         <div className="directory-picker-footer" style={{ display: "flex", justifyContent: "flex-end", alignItems: "center", gap: 10, flexShrink: 0, padding: "10px 18px", borderTop: "1px solid var(--border)" }}>
-          <button className="directory-picker-action" type="button" onClick={onCancel} disabled={busy} style={{ padding: "6px 14px", border: "1px solid var(--border)", borderRadius: 6, background: "none", color: "var(--text-muted)", cursor: busy ? "default" : "pointer", fontSize: 13 }}>{t("i18n.cancel")}</button>
+          <button className="directory-picker-action" type="button" onClick={onCancel} disabled={busy || remoteBusy} style={{ padding: "6px 14px", border: "1px solid var(--border)", borderRadius: 6, background: "none", color: "var(--text-muted)", cursor: busy || remoteBusy ? "default" : "pointer", fontSize: 13 }}>{t("i18n.cancel")}</button>
+          {mode === "local" && (
           <button
             className="directory-picker-action"
             type="button"
@@ -221,6 +434,7 @@ export function DirectoryPicker({ onCancel, onSelect, initialPath, busy = false,
           >
             {busy ? t("i18n.checking") : t("directoryPicker.selectThisFolder")}
           </button>
+          )}
         </div>
       </div>
     </div>,

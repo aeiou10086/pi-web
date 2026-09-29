@@ -1,7 +1,16 @@
 import { randomUUID } from "crypto";
 import { homedir } from "os";
 import type { IPty } from "node-pty";
+import { quotePosixShellArg } from "./remote-workspace";
 import { samePath } from "./paths";
+
+export interface RemoteTerminalTarget {
+  host: string;
+  port: number;
+  username: string;
+  identityFile?: string;
+  remotePath: string;
+}
 
 export type TerminalEvent =
   | { type: "output"; data: string; offset: number; reset?: boolean }
@@ -71,7 +80,7 @@ function dimension(value: number, fallback: number): number {
   return Math.min(1000, Math.max(2, Number.isFinite(value) ? Math.floor(value) : fallback));
 }
 
-export function createTerminal(cwd: string, cols: number, rows: number, id: string = randomUUID()): string {
+export function createTerminal(cwd: string, cols: number, rows: number, id: string = randomUUID(), remote?: RemoteTerminalTarget): string {
   const existing = registry().get(id);
   if (existing) {
     if (!samePath(existing.cwd, cwd)) throw new Error("Terminal belongs to a different workspace");
@@ -92,15 +101,30 @@ export function createTerminal(cwd: string, cols: number, rows: number, id: stri
       { cause: error },
     );
   }
-  const shell = process.platform === "win32"
-    ? process.env.ComSpec ?? "cmd.exe"
-    : process.env.SHELL || "/bin/sh";
-  const args = process.platform === "win32" ? [] : ["-l"];
-  const pty = spawn(shell, args, {
+  let command: string;
+  let args: string[];
+  let spawnCwd: string;
+  if (remote) {
+    // Tunnel the local pty to a remote login shell over SSH.
+    command = "ssh";
+    args = ["-t", "-o", "StrictHostKeyChecking=accept-new", "-o", "LogLevel=ERROR"];
+    if (remote.identityFile) args.push("-i", remote.identityFile);
+    if (remote.port !== 22) args.push("-p", String(remote.port));
+    args.push(`${remote.username}@${remote.host}`);
+    args.push(`cd ${quotePosixShellArg(remote.remotePath)} && exec \${SHELL:-/bin/bash}`);
+    spawnCwd = homedir();
+  } else {
+    command = process.platform === "win32"
+      ? process.env.ComSpec ?? "cmd.exe"
+      : process.env.SHELL || "/bin/sh";
+    args = process.platform === "win32" ? [] : ["-l"];
+    spawnCwd = cwd || homedir();
+  }
+  const pty = spawn(command, args, {
     name: "xterm-256color",
     cols: dimension(cols, 80),
     rows: dimension(rows, 24),
-    cwd: cwd || homedir(),
+    cwd: spawnCwd,
     env: shellEnvironment(),
   });
   const record: TerminalRecord = {

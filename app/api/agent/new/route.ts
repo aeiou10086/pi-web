@@ -5,6 +5,26 @@ import { randomUUID } from "crypto";
 import { allowFileRoot } from "@/lib/file-access";
 import { invalidateSessionListCache } from "@/lib/session-reader";
 import { startRpcSession } from "@/lib/rpc-manager";
+import { ensureRemoteAnchorDir, isRemoteAnchorDir, isRemoteWorkspaceKey, readRemoteWorkspaceSidecar, type RemoteWorkspace } from "@/lib/remote-workspace";
+
+function parseRemoteWorkspace(value: unknown): RemoteWorkspace | undefined {
+  if (!value || typeof value !== "object") return undefined;
+  const candidate = value as Record<string, unknown>;
+  const workspaceKey = candidate.workspaceKey;
+  const command = candidate.command;
+  const cwd = candidate.cwd;
+  if (typeof workspaceKey !== "string" || !isRemoteWorkspaceKey(workspaceKey)) return undefined;
+  if (typeof command !== "string" || !command.trim()) return undefined;
+  if (typeof cwd !== "string" || !cwd.trim()) return undefined;
+  const host = typeof candidate.host === "string" ? candidate.host : "";
+  const port = typeof candidate.port === "number" ? candidate.port : 22;
+  const username = typeof candidate.username === "string" ? candidate.username : "root";
+  const label = typeof candidate.label === "string" && candidate.label.trim()
+    ? candidate.label
+    : `${username}@${host}:${cwd}`;
+  const identityFile = typeof candidate.identityFile === "string" ? candidate.identityFile : undefined;
+  return { workspaceKey, label, command, cwd, host, port, username, ...(identityFile ? { identityFile } : {}) };
+}
 
 const THINKING_LEVELS = new Set<ThinkingLevel>(["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
 
@@ -23,9 +43,18 @@ export async function POST(req: Request) {
   let commandType: string | undefined;
   let promptAccepted = false;
   try {
-    const body = await req.json() as { cwd?: string; [key: string]: unknown };
-    const { cwd, ...command } = body;
+    const body = await req.json() as { cwd?: string; remote?: unknown; [key: string]: unknown };
+    const { cwd: requestedCwd, remote: remoteInput, ...command } = body;
     commandType = typeof command.type === "string" ? command.type : undefined;
+
+    let remote = parseRemoteWorkspace(remoteInput);
+    // Robustness: if the client lost the remote descriptor (e.g. a navigation
+    // race cleared it), recover it from the anchor dir sidecar so the session is
+    // still seeded and its tools route over SSH.
+    if (!remote && typeof requestedCwd === "string" && isRemoteAnchorDir(requestedCwd)) {
+      remote = readRemoteWorkspaceSidecar(requestedCwd) ?? undefined;
+    }
+    const cwd = remote ? ensureRemoteAnchorDir(remote.workspaceKey) : requestedCwd;
 
     if (!cwd || typeof cwd !== "string") {
       return NextResponse.json({
@@ -35,7 +64,7 @@ export async function POST(req: Request) {
           : {}),
       }, { status: 400 });
     }
-    if (!existsSync(cwd)) {
+    if (!remote && !existsSync(cwd)) {
       return NextResponse.json({
         error: `Directory does not exist: ${cwd}`,
         ...(commandType === "prompt"
@@ -59,6 +88,7 @@ export async function POST(req: Request) {
       ...(toolNames ? { toolNames } : {}),
       ...(provider && modelId ? { initialModel: { provider, modelId } } : {}),
       ...(explicitThinkingLevel ? { thinkingLevel: explicitThinkingLevel } : {}),
+      ...(remote ? { remote } : {}),
     });
 
     // Keep the files-route allowed-roots cache (see app/api/files/[...path]/route.ts)

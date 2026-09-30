@@ -11,9 +11,13 @@ import { closeSync, openSync, readSync, statSync } from "node:fs";
  */
 
 export interface SessionQA {
+  /** Latest generated title (`session_info.name`), if the user renamed it. */
+  title: string;
   firstPrompt: string;
   lastUser: string;
   lastAssistant: string;
+  /** Last run's failure text when the most recent assistant turn errored. */
+  lastError: string;
 }
 
 const HEAD_BYTES = 256 * 1024;
@@ -42,28 +46,53 @@ function textFromContent(content: unknown): string {
 function collect(lines: string[], state: SessionQA): void {
   for (const line of lines) {
     if (!line.trim()) continue;
-    let entry: { type?: string; message?: { role?: string; content?: unknown } };
+    let entry: {
+      type?: string;
+      name?: unknown;
+      message?: { role?: string; content?: unknown; errorMessage?: unknown; stopReason?: unknown };
+    };
     try {
       entry = JSON.parse(line) as typeof entry;
     } catch {
       continue;
     }
+    // A generated/renamed title lives in a top-level `session_info` entry.
+    if (entry.type === "session_info") {
+      const name = typeof entry.name === "string" ? entry.name.trim() : "";
+      if (name) state.title = name;
+      continue;
+    }
     if (entry.type !== "message") continue;
-    const role = entry.message?.role;
+    const message = entry.message;
+    const role = message?.role;
     if (role !== "user" && role !== "assistant") continue;
-    const text = textFromContent(entry.message?.content);
-    if (!text) continue;
+
     if (role === "user") {
+      const text = textFromContent(message?.content);
+      if (!text) continue;
       if (!state.firstPrompt) state.firstPrompt = text;
       state.lastUser = text;
-    } else {
+      continue;
+    }
+
+    // Assistant: a normal turn has text; a failed run has empty content and an
+    // error message. Track whichever came last as this run's outcome.
+    const text = textFromContent(message?.content);
+    if (text) {
       state.lastAssistant = text;
+      state.lastError = "";
+      continue;
+    }
+    const error = typeof message?.errorMessage === "string" ? message.errorMessage.trim() : "";
+    if (error || message?.stopReason === "error") {
+      state.lastAssistant = "";
+      state.lastError = error || "运行出错（模型未返回错误详情）";
     }
   }
 }
 
 export function readSessionQA(filePath: string): SessionQA {
-  const state: SessionQA = { firstPrompt: "", lastUser: "", lastAssistant: "" };
+  const state: SessionQA = { title: "", firstPrompt: "", lastUser: "", lastAssistant: "", lastError: "" };
   let size: number;
   try {
     size = statSync(filePath).size;

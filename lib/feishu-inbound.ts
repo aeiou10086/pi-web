@@ -1,6 +1,6 @@
 import * as Lark from "@larksuiteoapi/node-sdk";
 import { loadFeishuAppConfig } from "./feishu-config";
-import { sendFeishuText } from "./feishu-client";
+import { sendFeishuTextChunked } from "./feishu-client";
 import {
   findFeishuSessionByNumber,
   listFeishuSessions,
@@ -8,16 +8,23 @@ import {
   type FeishuSessionSummary,
 } from "./feishu-state";
 import { getRpcSession, startRpcSession } from "./rpc-manager";
-import { resolveSessionPath } from "./session-reader";
+import { listSessionSummaries, resolveSessionPath } from "./session-reader";
 
 /**
  * Feishu inbound message bridge (WebSocket 长连接 mode).
  *
- * The operator talks to the bot in a private (p2p) chat:
+ * The operator talks to the bot in a private (p2p) chat. Every message must
+ * either name a session by its stable number or be one of the English
+ * commands; anything else is rejected instead of being forwarded, so a stray
+ * message can never land in the wrong session.
+ *
  *   - `3 <text>` / `3，<text>` / `3,<text>` -> forward to session #3
- *   - `列表` / `list`                        -> recent 10 sessions
- *   - `列表全部` / `list all`                -> every registered session
- *   - `<text>` (no leading number)           -> the most recent session
+ *   - `3`                                   -> show session #3
+ *   - `list`                                -> recent 10 sessions
+ *   - `all`                                 -> every registered session
+ *   - `help` / `?`                          -> command reference
+ *   - anything else                         -> rejected with a format hint
+ *
  * App credentials live in `<agentDir>/feishu-app.json`.
  */
 
@@ -62,7 +69,30 @@ async function forwardMessageToSession(sessionId: string, text: string): Promise
 function formatSessionList(sessions: FeishuSessionSummary[]): string {
   if (sessions.length === 0) return "暂无已完成的会话（先在 pi-web 里跑完一个任务）";
   const lines = sessions.map((s) => `#${s.number} ${s.name}`);
-  return `可回复的会话（用「编号 内容」发送，如「${sessions[0].number} 继续」）：\n${lines.join("\n")}`;
+  return `可回复的会话（用「编号 内容」发送，如「${sessions[0].number} 继续」）：\n${lines.join("\n")}\n\n发 all 看全部，发 help 看命令`;
+}
+
+/** Current session titles, keyed by session id (best-effort). */
+async function liveNames(): Promise<Map<string, string>> {
+  const names = new Map<string, string>();
+  try {
+    for (const session of await listSessionSummaries()) {
+      if (session.name) names.set(session.id, session.name);
+    }
+  } catch {
+    // Best-effort: fall back to the name cached at registration time.
+  }
+  return names;
+}
+
+function nameOf(names: Map<string, string>, session: FeishuSessionSummary): string {
+  return names.get(session.sessionId) ?? session.name;
+}
+
+function renderSessionList(sessions: FeishuSessionSummary[], names: Map<string, string>): string {
+  if (sessions.length === 0) return "暂无已完成的会话（先在 pi-web 里跑完一个任务）";
+  const lines = sessions.map((s) => `#${s.number} ${nameOf(names, s)}`);
+  return `可回复的会话（用「编号 内容」发送，如「${sessions[0].number} 继续」）：\n${lines.join("\n")}\n\n发 all 看全部，发 help 看命令`;
 }
 
 function findByNumber(number: number): FeishuSessionSummary | undefined {
@@ -71,19 +101,38 @@ function findByNumber(number: number): FeishuSessionSummary | undefined {
   return listFeishuSessions().find((s) => s.sessionId === sessionId);
 }
 
-async function acknowledge(chatId: string, number: number, name: string): Promise<void> {
-  await sendFeishuText(chatId, `✅ 已转发到 #${number} ${name}`);
+async function acknowledge(chatId: string, target: FeishuSessionSummary): Promise<void> {
+  const names = await liveNames();
+  await sendFeishuTextChunked(chatId, `✅ 已转发到 #${target.number} ${nameOf(names, target)}`);
 }
+
+const HELP_TEXT = [
+  "📖 命令（英文）",
+  "list           最近 10 个会话",
+  "all            全部会话",
+  "<编号> <内容>   发给对应会话，如「3 继续做X」",
+  "<编号>         查看该会话",
+  "help / ?       本说明",
+].join("\n");
+
+const FORMAT_HINT = [
+  "⚠️ 请带上会话编号，例如「3 继续做X」。",
+  "发 list 看有哪些会话，发 help 看全部命令。",
+].join("\n");
 
 async function handleText(chatId: string, text: string): Promise<void> {
   const trimmed = text.trim();
 
-  if (/^(列表|list)$/i.test(trimmed)) {
-    await sendFeishuText(chatId, formatSessionList(listFeishuSessions(RECENT_LIST_LIMIT)));
+  if (/^list$/i.test(trimmed)) {
+    await sendFeishuTextChunked(chatId, renderSessionList(listFeishuSessions(RECENT_LIST_LIMIT), await liveNames()));
     return;
   }
-  if (/^(列表全部|全部会话|list\s*all|all)$/i.test(trimmed)) {
-    await sendFeishuText(chatId, formatSessionList(listFeishuSessions()));
+  if (/^all$/i.test(trimmed)) {
+    await sendFeishuTextChunked(chatId, renderSessionList(listFeishuSessions(), await liveNames()));
+    return;
+  }
+  if (/^(help|\?)$/i.test(trimmed)) {
+    await sendFeishuTextChunked(chatId, HELP_TEXT);
     return;
   }
 
@@ -94,12 +143,12 @@ async function handleText(chatId: string, text: string): Promise<void> {
     const content = withContent[2].trim();
     const target = findByNumber(number);
     if (!target) {
-      await sendFeishuText(chatId, `没有 #${number} 号会话（发「列表」看看有哪些）`);
+      await sendFeishuTextChunked(chatId, `没有 #${number} 号会话（发 list 看看有哪些）`);
       return;
     }
     if (!content) return;
     await forwardMessageToSession(target.sessionId, content);
-    await acknowledge(chatId, target.number, target.name);
+    await acknowledge(chatId, target);
     return;
   }
 
@@ -108,21 +157,16 @@ async function handleText(chatId: string, text: string): Promise<void> {
   if (numberOnly) {
     const target = findByNumber(parseInt(numberOnly[1], 10));
     if (!target) {
-      await sendFeishuText(chatId, `没有 #${numberOnly[1]} 号会话（发「列表」看看有哪些）`);
+      await sendFeishuTextChunked(chatId, `没有 #${numberOnly[1]} 号会话（发 list 看看有哪些）`);
       return;
     }
-    await sendFeishuText(chatId, `#${target.number} ${target.name}\n要发内容请用「${target.number} 你的指令」`);
+    const names = await liveNames();
+    await sendFeishuTextChunked(chatId, `#${target.number} ${nameOf(names, target)}\n要发内容请用「${target.number} 你的指令」`);
     return;
   }
 
-  // No leading number: the most recent session.
-  const recent = listFeishuSessions(1)[0];
-  if (!recent) {
-    await sendFeishuText(chatId, "暂无已完成的会话（先在 pi-web 里跑完一个任务）");
-    return;
-  }
-  await forwardMessageToSession(recent.sessionId, trimmed);
-  await acknowledge(chatId, recent.number, recent.name);
+  // Anything else is rejected: never forward an unaddressed message.
+  await sendFeishuTextChunked(chatId, FORMAT_HINT);
 }
 
 async function handleMessageEvent(data: FeishuReceiveEvent): Promise<void> {
@@ -144,7 +188,7 @@ async function handleMessageEvent(data: FeishuReceiveEvent): Promise<void> {
     await handleText(chatId, text);
   } catch (error) {
     console.error("[pi-web] 飞书消息处理失败:", error instanceof Error ? error.message : error);
-    await sendFeishuText(chatId, `❌ 处理失败：${error instanceof Error ? error.message : String(error)}`).catch(() => {});
+    await sendFeishuTextChunked(chatId, `❌ 处理失败：${error instanceof Error ? error.message : String(error)}`).catch(() => {});
   }
 }
 

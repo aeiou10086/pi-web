@@ -1,7 +1,7 @@
 import { homedir } from "node:os";
-import { sendFeishuText } from "./feishu-client";
+import { sendFeishuTextChunked } from "./feishu-client";
 import { getFeishuChatId, registerFeishuSession } from "./feishu-state";
-import { readSessionQA } from "./feishu-session-qa";
+import { readSessionQA, type SessionQA } from "./feishu-session-qa";
 import { listSessionSummaries, resolveSessionPath } from "./session-reader";
 
 /**
@@ -10,9 +10,9 @@ import { listSessionSummaries, resolveSessionPath } from "./session-reader";
  * agent's final answer, so the operator can read and continue it on a phone.
  */
 
+// The header shows only a short preview; 𝗤 / 𝗔 are sent in full (long replies
+// are split into numbered parts instead of being truncated).
 const FIRST_PROMPT_MAX = 80;
-const LAST_USER_MAX = 1000;
-const LAST_ASSISTANT_MAX = 2000;
 
 function formatTimestamp(date: Date): string {
   const pad = (n: number) => String(n).padStart(2, "0");
@@ -46,7 +46,11 @@ export async function sendFeishuCompletionNotification(sessionId: string): Promi
   if (!chatId) return;
 
   const filePath = await resolveSessionPath(sessionId);
-  const qa = filePath ? readSessionQA(filePath) : { firstPrompt: "", lastUser: "", lastAssistant: "" };
+  const qa: SessionQA = filePath
+    ? readSessionQA(filePath)
+    : { title: "", firstPrompt: "", lastUser: "", lastAssistant: "", lastError: "" };
+  // A failed run has an error and no assistant text; surface it as the answer.
+  const failed = !qa.lastAssistant && Boolean(qa.lastError);
 
   let name = "";
   let cwd = "";
@@ -57,21 +61,28 @@ export async function sendFeishuCompletionNotification(sessionId: string): Promi
   } catch {
     // Best-effort metadata.
   }
-  const displayName = compactSessionName(name || qa.firstPrompt || sessionId);
+  // Prefer the session's generated/renamed title (from its file), then the
+  // session-list name, then the first message.
+  const displayName = compactSessionName(qa.title || name || qa.firstPrompt || sessionId);
   const number = registerFeishuSession(sessionId, displayName);
 
   const lines = [
-    `🔷 [${number}] ${displayName}`,
+    `🔷 [${number}] ${displayName}${failed ? " ❌" : ""}`,
     ...(cwd ? [`📂 ${shortenHome(cwd)}`] : []),
     `🕐 ${formatTimestamp(new Date())}`,
   ];
   if (qa.firstPrompt) lines.push(truncate(qa.firstPrompt, FIRST_PROMPT_MAX));
   if (qa.lastUser) {
-    lines.push("", "═══════════════", "", "𝗤:", truncate(qa.lastUser, LAST_USER_MAX));
+    lines.push("", "═══════════════", "", "𝗤:", qa.lastUser);
   }
-  if (qa.lastAssistant) {
-    lines.push("", "───────────────", "", "𝗔:", truncate(qa.lastAssistant, LAST_ASSISTANT_MAX));
-  }
+  // Always render the answer slot, so a run that failed without producing text
+  // is not mistaken for a reply that simply omits 𝗔.
+  const answer = qa.lastAssistant
+    ? qa.lastAssistant
+    : qa.lastError
+      ? `❌ 运行出错：${qa.lastError}`
+      : "(无回复内容)";
+  lines.push("", "───────────────", "", "𝗔:", answer);
 
-  await sendFeishuText(chatId, lines.join("\n"));
+  await sendFeishuTextChunked(chatId, lines.join("\n"));
 }
